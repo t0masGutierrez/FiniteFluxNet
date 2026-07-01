@@ -1,0 +1,179 @@
+# ============================================================================
+# EXPERIMENT
+# ============================================================================
+
+experiment:
+  name: cubic_flux_foundation_v1
+  seed: 42
+  output_dir: results/cubic_flux_foundation_v1
+  device: cuda
+  dtype: float32
+
+# ============================================================================
+# SPATIAL DOMAIN
+# ============================================================================
+
+domain:
+  dimension: 1
+  axis:
+    x:
+      min: 0.0
+      max: 1.0
+      nx: 100
+      periodic: true
+    y:
+      min: null
+      max: null
+      nx: null
+      periodic: null
+    z:
+      min: null
+      max: null
+      nx: null
+      periodic: null
+
+# ============================================================================
+# TEMPORAL DOMAIN
+# ============================================================================
+
+time:
+  min: 0.0
+  max: 0.5
+  nt: 1001
+  save_every: 1
+
+# ============================================================================
+# PDE
+# ============================================================================
+
+pde:
+  name: scalar_conservation_law
+  parameters:
+    flux_family: cubic_polynomial
+    flux_formula: a * u**3 + b * u**2 + c * u
+    coefficient_distribution:
+      a:
+        type: uniform
+        min: -1.0
+        max: 1.0
+      b:
+        type: uniform
+        min: -1.0
+        max: 1.0
+      c:
+        type: uniform
+        min: -1.0
+        max: 1.0
+    num_operators: 1000
+    tau: 0.1
+    directions:
+      forward: true
+      reverse: true
+
+# ============================================================================
+# INITIAL CONDITION
+# ============================================================================
+
+initial_condition:
+  type: periodic_gaussian
+  parameters:
+    num_per_operator: 100
+    mean: 0.0
+    sigma: 1.0
+    ell: 1.0
+    abs_max: 3.0
+
+# ============================================================================
+# BOUNDARY CONDITION
+# ============================================================================
+
+boundary_condition:
+  x_min:
+    type: periodic
+    value: null
+  x_max:
+    type: periodic
+    value: null
+  y_min:
+    type: null
+    value: null
+  y_max:
+    type: null
+    value: null
+  z_min:
+    type: null
+    value: null
+  z_max:
+    type: null
+    value: null
+
+# ============================================================================
+# NUMERICAL METHOD
+# ============================================================================
+
+solver:
+  spatial:
+    method: weno
+    order: 3
+  temporal:
+    method: rk4
+    order: 4
+  cfl: 0.5
+
+# ============================================================================
+# DATASET
+# ============================================================================
+
+dataset:
+  num_simulations: 100000
+  save_format: hdf5
+  train_split: 0.8
+  valid_split: 0.1
+  test_split: 0.1
+
+# ============================================================================
+# MODEL
+# ============================================================================
+
+model:
+  architecture: icon_transformer
+  input_channels: 2
+  output_channels: 1
+  hidden_dim: 256
+  num_layers: 6
+
+# ============================================================================
+# TRAINING
+# ============================================================================
+
+training:
+  batch_size: 16
+  epochs: null
+  optimizer: adamw
+  learning_rate: 0.0001
+  weight_decay: 0.0
+  scheduler: warmup_cosine_decay
+
+# ============================================================================
+# EVALUATION
+# ============================================================================
+
+evaluation:
+  metrics:
+    - relative_l2
+    - l1
+  rollout_steps:
+    - 1
+    - 2
+    - 5
+    - 10
+
+# ============================================================================
+# LOGGING
+# ============================================================================
+
+logging:
+  checkpoint_every: 10000
+  log_every: 100
+  save_weights: true
+  save_predictions: true
