@@ -40,7 +40,7 @@ $$
 \mathcal{T}_{\theta}:
 \bigl(
 u_q(t,x),
-\lbrace u_i(t,x),\,u_i(t+\tau,x)\rbrace_{i=1}^{k}
+\lbrace u_i(t,x)\,u_i(t+\tau,x)\rbrace_{i=1}^{k}
 \bigr)
 \longmapsto
 \hat{u}_q(t+\tau,x).
