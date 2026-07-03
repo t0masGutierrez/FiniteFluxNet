@@ -41,7 +41,7 @@ $$
 \bigl(
 u_q(t,x),
 \lbrace
-u_i(t,x),\,u_i(t+\tau,x)
+u_i(t,x),\u_i(t+\tau,x)
 \rbrace_{i=1}^{k}
 \bigr)
 \longmapsto
@@ -74,7 +74,7 @@ R_{f,\tau}:
 u(t+\tau,x)
 \longmapsto
 \lbrace
-\,v
+\v
 \mid
 F_{f,\tau}(v)=u(t+\tau,x)
 \rbrace.
