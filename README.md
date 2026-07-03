@@ -24,8 +24,7 @@ $$
 The covariance kernel is
 
 $$
-k(x,x')
-=
+k(x,x') =
 \sigma^2
 \exp\!\left(
 -\frac{1-\cos\!\left(2\pi(x-x')\right)}
@@ -51,8 +50,7 @@ $$
 The model predicts the future state of query trajectory using set of context trajectories.
 
 $$
-\mathcal{T}_{\theta}:
-\left(
+\mathcal{T}_{\theta}: \left(
 u_q(t,x),
 \left\{
 u_i(t,x),\,
@@ -110,8 +108,7 @@ $$
 R_{f,\tau}:
 u(t+\tau,x)
 \longmapsto
-\left\{
-v
+\left\{v
 \mid
 F_{f,\tau}(v)=u(t+\tau,x)
 \right\}.
