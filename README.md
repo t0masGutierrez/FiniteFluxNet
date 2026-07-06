@@ -9,6 +9,10 @@ $$
 =0.
 $$
 
+$$
+\frac{d}{dt}(\text{cell length}) = \text{inflow} - \text{outflow}
+$$
+
 with periodic boundary conditions
 
 $$
@@ -122,7 +126,7 @@ $$
 | Symbol | Meaning |
 |--------|---------|
 | $F_{f,\tau}$ | Forward evolution operator |
-| $R_{f,\tau}$ | Reverse operator |
+| $R_{f,\tau}$ | Reverse involution operator |
 | $v$ | Candidate previous state |
 
 ---
