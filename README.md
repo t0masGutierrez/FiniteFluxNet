@@ -30,11 +30,25 @@ The covariance kernel is
 $$
 k(x,x') =
 \sigma^2
-\exp\!\biggl(
--\frac{1-\cos\!\bigl(2\pi(x-x')\bigr)}
+\exp\biggl(
+-\frac{1-\cos\!\bigl(2\pi(x-x'))}
 {\ell^2}
 \biggr).
 $$
+
+### Notation
+
+| Symbol | Meaning |
+|--------|---------|
+| $u$ | Conserved quantity |
+| $x$ | Spatial coordinate |
+| $t$ | Time |
+| $f$ | Flux function |
+| $k$ | Covariance kernel |
+| $\sigma$ | Standard deviation |
+| $\ell$ | Correlation length |
+
+---
 
 # Neural Network
 
@@ -49,6 +63,20 @@ u_q(t,x),
 \longmapsto
 \hat{u}_q(t+\tau,x).
 $$
+
+### Notation
+
+| Symbol | Meaning |
+|--------|---------|
+| $\mathcal{T}_{\theta}$ | Neural network with parameters $\theta$ |
+| $u_q(t,x)$ | Query input state |
+| $\hat{u}_q(t+\tau,x)$ | Predicted future query state |
+| $u_i(t,x)$ | Context input state |
+| $u_i(t+\tau,x)$ | Context target state |
+| $k$ | Number of context examples |
+| $\tau$ | Time step |
+
+---
 
 # In-Distribution Flux Functions
 
@@ -83,10 +111,11 @@ $$
 | Symbol | Meaning |
 |--------|---------|
 | $F_{f,\tau}$ | Forward evolution operator |
-| $R_{f,\tau}$ | Reverse involution operator |
+| $R_{f,\tau}$ | Reverse operator |
 | $v$ | Candidate previous state |
 
 ---
+
 # Out-of-Distribution Flux Functions
 
 $$
