@@ -6,7 +6,7 @@ experiment:
   name: cubic_flux_foundation_v1
   seed: 42
   output_dir: results/cubic_flux_foundation_v1
-  device: cuda
+  device: cpu
   dtype: float32
 
 # ============================================================================
@@ -57,7 +57,6 @@ pde:
         min: -1.0
         max: 1.0
     num_operators: 1000
-    tau: 0.1
     directions:
       forward: true
       reverse: true

@@ -1,17 +1,18 @@
 from __future__ import annotations
-import pathlib
-from pathlib import Path
 from typing import Annotated, Any, Sequence, Tuple
 import yaml
 import numpy as np
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+from jax import jit
 import json
+from pathlib import Path
+import sympy as sp
 
 
 def load_config(
-        path: str | Path
+        path: str
         ) -> dict[str, Any]:
     """
     load YAML configuration file into Python configuration object
@@ -19,7 +20,7 @@ def load_config(
     parameters
     ----------
     path
-        path to the YAML configuration file
+        path to the configuration file
 
     returns
     -------
@@ -29,6 +30,51 @@ def load_config(
     with open(path, "r") as file:
         config = yaml.safe_load(file)
     return config
+
+
+def get_device(
+        config: dict[str, Any]
+        ) -> Sequence[jax.Device]:
+    """
+    report the configured JAX device
+
+    parameters
+    ----------
+    config
+        configuration object containing experiment, space, time, pde, initial_condition, boundary_condition, solver, dataset, model, training, evaluation, and logging settings
+
+    returns
+    -------
+    devs
+        availabled JAX devices
+    """
+    device = config["experiment"].get("device") or "auto"
+    device = str(device).lower()
+    platform = {
+        "auto": None,
+        "cpu": "cpu",
+        "gpu": "gpu",
+        "tpu": "tpu",
+    }
+    if device not in platform:
+        choices = ", ".join(sorted(platform))
+        raise ValueError(f"unknown JAX device {device!r}; expected one of: {choices}")
+
+    platform = platform[device]
+    if platform is not None:
+        jax.config.update("jax_platform_name", platform)
+
+    try:
+        devs = jax.devices()
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"config requested experiment.device={device!r}, but JAX could not "
+            f"initialize platform {platform!r}. On this machine, use device: cpu "
+            "unless you install a supported accelerator backend."
+        ) from exc
+
+    print(f"Using JAX backend {jax.default_backend()} on {devs}")
+    return devs
 
 
 def build_domain(
@@ -68,7 +114,7 @@ def build_domain(
     max = config["space"]["axis"]["x"]["max"]
     n = config["space"]["axis"]["x"]["n"]
     periodic = config["space"]["axis"]["x"]["periodic"]
-    x = jnp.linspace(min, max, n, endpoint = not periodic)
+    x = jnp.linspace(min, max, n, endpoint=False)
 
     # temporal domain
     min = config["time"]["min"]
@@ -169,7 +215,10 @@ def sample_coeff(
         key: Annotated[jax.Array, "() | (2,)"],
         *,
         n: int
-        ) -> Annotated[jax.Array, "(n,)"]:
+        ) -> Tuple[
+            Annotated[jax.Array, "() | (2,)"],
+            Annotated[jax.Array, "(n,)"]
+            ]:
     """
     sample coefficients from uniform probability distribution
 
@@ -184,10 +233,14 @@ def sample_coeff(
     
     returns
     -------
+    key
+        updated random number generator
     coeffs
         coefficients
     """
-    return jr.uniform(key, (n,), minval=domain[0], maxval=domain[1])
+    key, subkey = jr.split(key)
+    coeffs = jr.uniform(subkey, (n,), minval=domain[0], maxval=domain[1])
+    return key, coeffs
 
 
 def flux(
@@ -206,7 +259,6 @@ def flux(
 
     returns
     -------
-    f
         flux
     """
     return coeffs[0] * u ** 3 + coeffs[1] * u ** 2 + coeffs[2] * u
@@ -217,7 +269,7 @@ def speed(
         coeffs: Annotated[jax.Array, "(3,)"],
         ) -> Annotated[jax.Array, "() | (nx,)"]:
     """
-    compute speed
+    compute 1st derivative
 
     parameters
     ----------
@@ -228,12 +280,11 @@ def speed(
     
     returns
     ------
-    speed
         speed
     """
-    f = lambda u: flux(u, coeffs) # partial application
-    J = jax.jacrev(f)(u)
-    return jnp.abs(J)
+    # f = lambda u: flux(u, coeffs) # partial application
+    # J = jax.jacrev(f)(u)
+    return jnp.abs(3 * coeffs[0] * u ** 2 + 2 * coeffs[1] * u + coeffs[2])
 
 
 def max_speed(
@@ -242,7 +293,7 @@ def max_speed(
         eps: float = 1e-8
         ) -> float:
     """
-    compute max speed
+    compute maximum of 1st derivative
 
     parameters
     ----------
@@ -279,7 +330,6 @@ def time_step(
     
     returns
     -------
-    dt
         time step
     """
     return cfl * dx / max_speed
@@ -336,164 +386,140 @@ def numerical_flux(
 
     returns
     -------
-    num_flux
         numerical flux
     """
-    ORDER = 5  # 5th order WENO
-    CENTER = 2  # index of central solution
+    # create stencil
+    # left = {i-2, i-1, i, i+1, i+2} 
+    # right = {i+3, i+2, i+1, i, i-1}
+    minus2 = jnp.roll(u, 2)
+    minus1 = jnp.roll(u, 1)
+    zero = u
+    plus1 = jnp.roll(u, -1)
+    plus2 = jnp.roll(u, -2)
+    plus3 = jnp.roll(u, -3)
+    left_s0 = jnp.stack([minus2, minus1, zero])
+    left_s1 = jnp.stack([minus1, zero, plus1])
+    left_s2 = jnp.stack([zero, plus1, plus2])
+    right_s0 = jnp.stack([plus3, plus2, plus1])
+    right_s1 = jnp.stack([plus2, plus1, zero])
+    right_s2 = jnp.stack([plus1, zero, minus1])
 
-    num_flux = np.empty(u.shape)
-    for i in range(len(u)):
+    def smooth_stencil(
+            s0: Annotated[jax.Array, "(3,)"],
+            s1: Annotated[jax.Array, "(3,)"],
+            s2: Annotated[jax.Array, "(3,)"]
+            ) -> Tuple[
+                Annotated[jax.Array, "()"],
+                Annotated[jax.Array, "()"],
+                Annotated[jax.Array, "()"]
+                ]:
+        """
+        compute smoothness of stencil
+        """
+        beta0 = 13 / 12 * (s0[0] - 2 * s0[1] + s0[2]) ** 2 + 1 / 4 * (
+            s0[0] - 4 * s0[1] + 3 * s0[2]
+        ) ** 2
+        beta1 = 13 / 12 * (s1[0] - 2 * s1[1] + s1[2]) ** 2 + 1 / 4 * (
+            s1[0] - s1[2]
+        ) ** 2
+        beta2 = 13 / 12 * (s2[0] - 2 * s2[1] + s2[2]) ** 2 + 1 / 4 * (
+            3 * s2[0] - 4 * s2[1] + s2[2]
+        ) ** 2
+        return beta0, beta1, beta2
 
-        def create_stencil(
-                u: Annotated[jax.Array, "(nx,)"],
-                *,
-                i: int,
-                side: str
-                ) -> Tuple[
-                    Annotated[jax.Array, "(3,)"],
-                    Annotated[jax.Array, "(3,)"],
-                    Annotated[jax.Array, "(3,)"]
-                    ]:
-            """
-            choose spatial stencil for approximating solution at cell interface \\
-            left = {i-2, i-1, i, i+1, i+2} \\
-            right = {i+3, i+2, i+1, i, i-1}
-            """
-            if side == "right":
-                i += 1
-            stencil = np.empty((ORDER,))
-            for n in range(ORDER - CENTER):
-                before, after = neighbor(u, i=i, n=n)
-                stencil[CENTER - n] = before
-                stencil[CENTER + n] = after
-            if side == "right":
-                stencil = jnp.flip(stencil)
-            s0 = jnp.array([stencil[0], stencil[1], stencil[2]])
-            s1 = jnp.array([stencil[1], stencil[2], stencil[3]])
-            s2 = jnp.array([stencil[2], stencil[3], stencil[4]])
-            return s0, s1, s2
+    left_beta0, left_beta1, left_beta2 = smooth_stencil(left_s0, left_s1, left_s2)
+    right_beta0, right_beta1, right_beta2 = smooth_stencil(right_s0, right_s1, right_s2)
 
-        left_s0, left_s1, left_s2 = create_stencil(u, i=i, side="left")
-        right_s0, right_s1, right_s2 = create_stencil(u, i=i, side="right")
+    def weight_stencil(
+            beta0: Annotated[jax.Array, "()"],
+            beta1: Annotated[jax.Array, "()"],
+            beta2: Annotated[jax.Array, "()"],
+            *,
+            eps: float = 1e-6
+            ) -> Tuple[
+                Annotated[jax.Array, "()"],
+                Annotated[jax.Array, "()"],
+                Annotated[jax.Array, "()"]
+                ]:
+        """
+        if smooth stencil then large weight \\
+        if rough stencil then small weight
+        """
+        alpha0 = 1 / 10 / (eps + beta0) ** 2
+        alpha1 = 6 / 10 / (eps + beta1) ** 2
+        alpha2 = 3 / 10 / (eps + beta2) ** 2
+        return alpha0, alpha1, alpha2
 
-        def smooth_stencil(
-                s0: Annotated[jax.Array, "(3,)"],
-                s1: Annotated[jax.Array, "(3,)"],
-                s2: Annotated[jax.Array, "(3,)"]
-                ) -> Tuple[
-                    Annotated[jax.Array, "()"],
-                    Annotated[jax.Array, "()"],
-                    Annotated[jax.Array, "()"]
-                    ]:
-            """
-            compute smoothness of stencil
-            """
-            beta0 = 13 / 12 * (s0[0] - 2 * s0[1] + s0[2]) ** 2 + 1 / 4 * (
-                s0[0] - 4 * s0[1] + 3 * s0[2]
-            ) ** 2
-            beta1 = 13 / 12 * (s1[0] - 2 * s1[1] + s1[2]) ** 2 + 1 / 4 * (
-                s1[0] - s1[2]
-            ) ** 2
-            beta2 = 13 / 12 * (s2[0] - 2 * s2[1] + s2[2]) ** 2 + 1 / 4 * (
-                3 * s2[0] - 4 * s2[1] + s2[2]
-            ) ** 2
-            return beta0, beta1, beta2
+    left_alpha0, left_alpha1, left_alpha2 = weight_stencil(left_beta0, left_beta1, left_beta2)
+    right_alpha0, right_alpha1, right_alpha2 = weight_stencil(right_beta0, right_beta1, right_beta2)
 
-        left_beta0, left_beta1, left_beta2 = smooth_stencil(left_s0, left_s1, left_s2)
-        right_beta0, right_beta1, right_beta2 = smooth_stencil(right_s0, right_s1, right_s2)
+    def norm_weight(
+            alpha0: Annotated[jax.Array, "()"],
+            alpha1: Annotated[jax.Array, "()"],
+            alpha2: Annotated[jax.Array, "()"]
+            ) -> Tuple[
+                Annotated[jax.Array, "()"],
+                Annotated[jax.Array, "()"],
+                Annotated[jax.Array, "()"]
+                ]:
+        """
+        normalize stencil weight
+        """
+        omega0 = alpha0 / (alpha0 + alpha1 + alpha2)
+        omega1 = alpha1 / (alpha0 + alpha1 + alpha2)
+        omega2 = alpha2 / (alpha0 + alpha1 + alpha2)
+        return omega0, omega1, omega2
 
-        def weight_stencil(
-                beta0: Annotated[jax.Array, "()"],
-                beta1: Annotated[jax.Array, "()"],
-                beta2: Annotated[jax.Array, "()"],
-                *,
-                eps: float = 1e-6
-                ) -> Tuple[
-                    Annotated[jax.Array, "()"],
-                    Annotated[jax.Array, "()"],
-                    Annotated[jax.Array, "()"]
-                    ]:
-            """
-            if smooth stencil then large weight \\
-            if rough stencil then small weight
-            """
-            alpha0 = 1 / 10 / (eps + beta0) ** 2
-            alpha1 = 6 / 10 / (eps + beta1) ** 2
-            alpha2 = 3 / 10 / (eps + beta2) ** 2
-            return alpha0, alpha1, alpha2
+    left_omega0, left_omega1, left_omega2 = norm_weight(left_alpha0, left_alpha1, left_alpha2)
+    right_omega0, right_omega1, right_omega2 = norm_weight(
+        right_alpha0, right_alpha1, right_alpha2
+    )
 
-        left_alpha0, left_alpha1, left_alpha2 = weight_stencil(left_beta0, left_beta1, left_beta2)
-        right_alpha0, right_alpha1, right_alpha2 = weight_stencil(right_beta0, right_beta1, right_beta2)
+    def approx_sol(
+            s0: Annotated[jax.Array, "(3,)"],
+            s1: Annotated[jax.Array, "(3,)"],
+            s2: Annotated[jax.Array, "(3,)"]
+            ) -> Tuple[
+                Annotated[jax.Array, "()"],
+                Annotated[jax.Array, "()"],
+                Annotated[jax.Array, "()"]
+                ]:
+        """
+        approximate solution at cell interface using Lagrange interpolation \\
+        q \\approx u(x_{i+0.5})
+        """
+        q0 = 1 / 3 * s0[0] - 7 / 6 * s0[1] + 11 / 6 * s0[2]
+        q1 = -1 / 6 * s1[0] + 5 / 6 * s1[1] + 1 / 3 * s1[2]
+        q2 = 1 / 3 * s2[0] + 5 / 6 * s2[1] - 1 / 6 * s2[2]
+        return q0, q1, q2
 
-        def norm_weight(
-                alpha0: Annotated[jax.Array, "()"],
-                alpha1: Annotated[jax.Array, "()"],
-                alpha2: Annotated[jax.Array, "()"]
-                ) -> Tuple[
-                    Annotated[jax.Array, "()"],
-                    Annotated[jax.Array, "()"],
-                    Annotated[jax.Array, "()"]
-                    ]:
-            """
-            normalize stencil weight
-            """
-            omega0 = alpha0 / (alpha0 + alpha1 + alpha2)
-            omega1 = alpha1 / (alpha0 + alpha1 + alpha2)
-            omega2 = alpha2 / (alpha0 + alpha1 + alpha2)
-            return omega0, omega1, omega2
+    left_q0, left_q1, left_q2 = approx_sol(left_s0, left_s1, left_s2)
+    right_q0, right_q1, right_q2 = approx_sol(right_s0, right_s1, right_s2)
 
-        left_omega0, left_omega1, left_omega2 = norm_weight(left_alpha0, left_alpha1, left_alpha2)
-        right_omega0, right_omega1, right_omega2 = norm_weight(
-            right_alpha0, right_alpha1, right_alpha2
+    # reconstruct solution
+    """
+    WENO5 (Weighted Essentially Non-Oscillatory fifth-order) reconstructs high-order estimates of the solution at cell interfaces by adaptively combining several lower-order stencils, assigning larger weights to smooth stencils and smaller weights to stencils containing discontinuities. This produces fifth-order accuracy in smooth parts of the solution while preventing the spurious oscillations that standard high-order methods generate near shocks and other sharp gradients.
+    """
+    left_sol = left_q0 * left_omega0 + left_q1 * left_omega1 + left_q2 * left_omega2
+    right_sol = right_q0 * right_omega0 + right_q1 * right_omega1 + right_q2 * right_omega2
+
+    # compute local lax-friedrichs / rusanov flux
+    left_flux = flux(left_sol, coeffs)
+    right_flux = flux(right_sol, coeffs)
+    left_speed = speed(left_sol, coeffs)
+    right_speed = speed(right_sol, coeffs)
+    bi_max_speed = jnp.maximum(left_speed, right_speed)
+    num_flux = 0.5 * (
+        left_flux + right_flux
+        ) - 0.5 * bi_max_speed * (
+        right_sol - left_sol
         )
-
-        def approx_sol(
-                s0: Annotated[jax.Array, "(3,)"],
-                s1: Annotated[jax.Array, "(3,)"],
-                s2: Annotated[jax.Array, "(3,)"]
-                ) -> Tuple[
-                    Annotated[jax.Array, "()"],
-                    Annotated[jax.Array, "()"],
-                    Annotated[jax.Array, "()"]
-                    ]:
-            """
-            approximate solution at cell interface using Lagrange interpolation \\
-            q \\approx u(x_{i+0.5})
-            """
-            q0 = 1 / 3 * s0[0] - 7 / 6 * s0[1] + 11 / 6 * s0[2]
-            q1 = -1 / 6 * s1[0] + 5 / 6 * s1[1] + 1 / 3 * s1[2]
-            q2 = 1 / 3 * s2[0] + 5 / 6 * s2[1] - 1 / 6 * s2[2]
-            return q0, q1, q2
-
-        left_q0, left_q1, left_q2 = approx_sol(left_s0, left_s1, left_s2)
-        right_q0, right_q1, right_q2 = approx_sol(right_s0, right_s1, right_s2)
-
-        # reconstruct solution
-        """
-        WENO5 (Weighted Essentially Non-Oscillatory fifth-order) reconstructs high-order estimates of the solution at cell interfaces by adaptively combining several lower-order stencils, assigning larger weights to smooth stencils and smaller weights to stencils containing discontinuities. This produces fifth-order accuracy in smooth parts of the solution while preventing the spurious oscillations that standard high-order methods generate near shocks and other sharp gradients.
-        """
-        left_sol = left_q0 * left_omega0 + left_q1 * left_omega1 + left_q2 * left_omega2
-        right_sol = right_q0 * right_omega0 + right_q1 * right_omega1 + right_q2 * right_omega2
-
-        # compute local lax-friedrichs / rusanov flux
-        left_flux = flux(left_sol, coeffs)
-        right_flux = flux(right_sol, coeffs)
-        left_speed = speed(left_sol, coeffs)
-        right_speed = speed(right_sol, coeffs)
-        left_max_speed = max_speed(left_speed)
-        right_max_speed = max_speed(right_speed)
-        bi_max_speed = jnp.maximum(left_max_speed, right_max_speed)
-        num_flux[i] = 0.5 * (
-            left_flux + right_flux
-            ) - 0.5 * bi_max_speed * (
-            right_sol - left_sol
-            )
     return jnp.array(num_flux)
 
 
-def rhs(
-        num_flux: Annotated[jax.Array, "(nx,)"],
+def divergence(
+        u: Annotated[jax.Array, "(nx,)"],
+        coeffs: Annotated[jax.Array, "(3,)"],
         dx: float
         ) -> Annotated[jax.Array, "(nx,)"]:
     """
@@ -502,24 +528,24 @@ def rhs(
 
     parameters
     ----------
-    num_flux
-        numerical flux
+    u
+        solution
+    coeffs
+        coefficients
     dx
         grid spacing
     
     returns
     -------
-    rhs
-        rhs of 1d conservation law
+        divergence of 1d conservation law
     """
-    dfdx = np.empty(num_flux.shape)
-    for i in range(len(num_flux)):
-        dfdx[i] = -(num_flux[i] - num_flux[i - 1]) / dx
-    return jnp.array(dfdx)
+    num_flux = numerical_flux(u, coeffs)
+    return -(num_flux - jnp.roll(num_flux, 1)) / dx
 
 
 def rk4_step(
-        num_flux: Annotated[jax.Array, "(nx,)"],
+        u: Annotated[jax.Array, "(nx,)"],
+        coeffs: Annotated[jax.Array, "(3,)"],
         dx: float,
         dt: float
         ) -> Annotated[jax.Array, "(nx,)"]:
@@ -528,8 +554,10 @@ def rk4_step(
 
     parameters
     ----------
-    num_flux
-        numerical flux
+    u
+        solution
+    coeffs
+        coefficients
     dx
         grid spacing
     dt
@@ -540,17 +568,17 @@ def rk4_step(
     u_dt
         solution differential between time step
     """
-    k1 = rhs(num_flux, dx)
-    k2 = rhs(num_flux + k1 * dt / 2, dx)
-    k3 = rhs(num_flux + k2 * dt / 2, dx)
-    k4 = rhs(num_flux + k3 * dt, dx)
+    k1 = divergence(u, coeffs, dx)
+    k2 = divergence(u + k1 * dt / 2, coeffs, dx)
+    k3 = divergence(u + k2 * dt / 2, coeffs, dx)
+    k4 = divergence(u + k3 * dt, coeffs, dx)
     u_dt = dt / 6 * (k1 + 2 * k2 + 2 * k3 + k4)
     return u_dt
 
 
 def rk4_evolve(
         u: Annotated[jax.Array, "(nx,)"],
-        num_flux: Annotated[jax.Array, "(nx,)"],
+        coeffs: Annotated[jax.Array, "(n,)"],
         t: Annotated[jax.Array, "(nt,)"],
         dx: float,
         dt: float
@@ -562,6 +590,8 @@ def rk4_evolve(
     ----------
     u
         solution
+    coeffs
+        coefficients
     num_flux
         numerical flux
     t
@@ -581,7 +611,7 @@ def rk4_evolve(
     trajs = list()
     while time < max_time:
         trajs.append(u)
-        u_dt = rk4_step(num_flux, dx, dt)
+        u_dt = rk4_step(u, coeffs, dx, dt)
         u += u_dt
         time += dt
     trajs = jnp.array(trajs)
@@ -726,7 +756,8 @@ def batch_task(
         *,
         n: int,
         k: int
-        ) -> tuple[
+        ) -> Tuple[
+            Annotated[jax.Array, "() | (2,)"],
             Annotated[jax.Array, "(num_tasks, num_input_tokens, 3)"],
             Annotated[jax.Array, "(num_tasks, num_target_tokens, 3)"]
             ]:
@@ -748,6 +779,8 @@ def batch_task(
 
     returns
     -------
+    key
+        updated random number generator
     input_batch
         sampled input tasks
     target_batch
@@ -763,22 +796,22 @@ def batch_task(
         target_batch.append(target_tokens)
     input_batch = jnp.array(input_batch)
     target_batch = jnp.array(target_batch)
-    return input_batch, target_batch
+    return key, input_batch, target_batch
 
 
 def save_task(
-        path: str | Path,
+        path: str,
         input_batch: Annotated[jax.Array, "(num_tasks, num_input_tokens, 3)"],
         target_batch: Annotated[jax.Array, "(num_tasks, num_target_tokens, 3)"],
         config: dict[str, Any]
-        ) -> str | Path:
+        ) -> str:
     """
     save batch of tokenized tasks to disk
 
     parameters
     ----------
     path
-        path to the saved dataset file
+        path to the saved file
     input_batch
         batch of visible input tokens containing context inputs, context targets, and query inputs
     target_batch
@@ -789,7 +822,7 @@ def save_task(
     returns
     -------
     path
-        path to the saved dataset file
+        path to the saved file
     """
     metadata_json = json.dumps(config)
     metadata_np = np.array(metadata_json)
@@ -801,7 +834,7 @@ def save_task(
 
 
 def load_task(
-        path: str | Path
+        path: str
         ) -> Tuple[
             Annotated[jax.Array, "(num_tasks, num_input_tokens, 3)"],
             Annotated[jax.Array, "(num_tasks, num_target_tokens, 3)"],
@@ -813,7 +846,7 @@ def load_task(
     parameters
     ----------
     path
-        path to the saved dataset file
+        path to the loaded file
 
     returns
     -------
@@ -833,29 +866,40 @@ def load_task(
     return input_batch, target_batch, config
 
 
-def run(
-        path: str | Path
-        ) -> None:
+def build_chunk(
+        cfg_path: str,
+        id: int, 
+        key: Annotated[jax.Array, "() | (2,)"]
+        ) -> Tuple[
+            Annotated[jax.Array, "() | (2,)"],
+            str
+            ]:
     """
-    build dataset
+    build piece of dataset
 
     parameters
     ----------
-    path
-        path to the YAML configuration file
+    cfg_path
+        path to the configuration file
+    id
+        integer identifier for dataset chunk
+    key
+        random number generator
 
     returns
     -------
-    None
+    key
+        updated random number generator
+    chunk_path
+        path to the chunk file
     """
-    config = load_config(path)
+    config = load_config(cfg_path)
     x, t = build_domain(config)
     L = covariance(x)
-    key = jr.key(config["experiment"]["seed"])
     key, u_0 = initialize(x, L, key, n=config["initial_condition"]["parameters"]["n"])
     index = 50
     u = u_0[index]
-    coeffs = sample_coeff([config["pde"]["parameters"]["coefficient_distribution"]["min"], 
+    key, coeffs = sample_coeff([config["pde"]["parameters"]["coefficient_distribution"]["min"], 
                            config["pde"]["parameters"]["coefficient_distribution"]["max"]], key,
                            n=config["pde"]["parameters"]["coefficient_distribution"]["n"])
     v = speed(u, coeffs)
@@ -863,22 +907,61 @@ def run(
     xmin = x[0]
     xmax = x[-1]
     nx = len(x)
-    dx = float(xmax - xmin) / nx
+    dx = float(x[1] - x[0]) / nx
     dt = time_step(dx, max_v)
-    num_flux = numerical_flux(u, coeffs)    
-    trajs = rk4_evolve(u, num_flux, t, dx, dt)
+    trajs = rk4_evolve(u, coeffs, t, dx, dt)
     examples = demonstrate(trajs, n=config["dataset"]["horizon"])
-    input_batch, target_batch = batch_task(x, examples, key,
+    key, input_batch, target_batch = batch_task(x, examples, key,
                                            n=config["dataset"]["num_tasks"],
                                            k=config["dataset"]["num_context"])
-    path = save_task("/Users/tgut03/GitHub/foundation/data/task.npz", input_batch, target_batch, config)
-    input_batch, target_batch, config = load_task(path)
-    return None
+    chunk_path = save_task(f"/Users/tgut03/GitHub/foundation/data/task{id}.npz", input_batch, target_batch, config)
+    input_batch, target_batch, config = load_task(chunk_path)
+    return key, chunk_path
+
+
+def build_dataset(
+        cfg_path: str,
+        key: Annotated[jax.Array, "() | (2,)"],
+        *,
+        n: int
+        ) -> Tuple[
+            Annotated[jax.Array, "() | (2,)"],
+            dict[str, Any]
+            ]:
+    """
+    generate piece of larger dataset
+
+    parameters
+    ----------
+    cfg_path
+        path to the configuration file
+    key
+        random number generator
+    n
+        number of chunks
+
+    returns
+    -------
+    key
+        updated random number generator
+    config
+        configuration object containing experiment, space, time, pde, initial_condition, boundary_condition, solver, dataset, model, training, evaluation, and logging settings
+    """
+    config = load_config(cfg_path)
+    for id in range(n):
+        key, subkey = jr.split(key)
+        key, chunk_path = build_chunk(cfg_path, id, subkey)
+    return key, config
 
 
 def main() -> None:
-    run("/Users/tgut03/GitHub/foundation/config/cubic_config.yaml")
-
+    cfg_path = str(Path(__file__).resolve().parents[1] / "config" / "cubic.yaml")
+    config = load_config(cfg_path)
+    device = get_device(config)
+    key = jr.key(config["experiment"]["seed"])
+    key, config = build_dataset(cfg_path, key, n=2)
+    print(key)
+    print(config)
 
 if __name__ == "__main__":
     main()
